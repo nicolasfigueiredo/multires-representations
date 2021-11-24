@@ -1,75 +1,62 @@
 import numpy as np
-import math as m
-import scipy.signal as sig
+from math import ceil
 from scipy.interpolate import interp1d
+from librosa.filters import get_window
+from librosa.util import  dtype_r2c, MAX_MEM_BLOCK, frame
 
+def psi_warp(x, alfa):
+    return (-1+np.sqrt(1+2*alfa*x))/alfa
 
-def psi_warp(x, alpha):
-    """
-    Function description
-    """
-    return (-1 + np.sqrt(1 + 2 * alpha * x)) / alpha
+def phi_warp(x, alfa):
+    return (1+ 0.5 * alfa * x ) * x
 
+def fanchirpogram(y, alpha, sr, n_fft=2048, hop_length=None, win_length=None, window='hann', center=True, pad_mode='reflect', dtype=None):
+    
+    # By default, use the entire frame
+    if win_length is None:
+        win_length = n_fft
 
-def phi_warp(x, alpha):
-    """
-    Function description
-    """
-    return (1 + 1/2 * alpha * x) * x
+    # Set the default hop, if it's not already specified
+    if hop_length is None:
+        hop_length = int(win_length // 4)
+    
+    M = 1 << (abs(ceil(win_length/ (1-abs(alpha/sr) * win_length/2)) -1)).bit_length()
+    
+    fft_window = get_window(window, max(win_length, M), fftbins=True)
 
+    # Pad the window out to n_fft size
+    #fft_window = pad_center(fft_window, n_fft)
 
-def stfcht(x, alphas, win_length=1024, w='hanning', hop_size=256, sr=48000):
-    # Arrumar isso
-    w = np.hanning(win_length)
-    K = len(w)
+    # Reshape so that the window can be broadcast
+    fft_window = fft_window.reshape((-1, 1))
 
-    time = np.arange(K/(2*sr),
-                     ((np.floor((len(x) - K) / hop_size) + 1) * hop_size + K / 2 - 1) / sr,
-                     hop_size/sr)
-    freq = np.arange(0, K // 2 + 1) * sr / K
+    if center:
+        y = np.pad(y, int(n_fft // 2), mode=pad_mode)
+    
+    y_frames = frame(y, frame_length=n_fft, hop_length=hop_length)
+    if dtype is None:
+        dtype = dtype_r2c(y.dtype)
 
-    if len(alphas) < len(time):
-        alpha = alphas[0]
-        M = 2 ** (m.ceil(np.log2(m.ceil(K / (1-abs(alpha/sr) * K/2)))))
-        if M > K:
-            # porque não hanning(M)? os resamples não são iguais (como faz?)
-            w = sig.resample(w, M)
+    # Pre-allocate the STFT matrix
+    stft_matrix = np.empty(
+        (int(1 + n_fft // 2), y_frames.shape[1]), dtype=dtype, order="F"
+    )
 
-        if alpha != 0:
-            tn = (np.arange(0, K) - (K - 1) / 2) / sr
-            tr = phi_warp(tn[0], alpha) + (np.arange(0, M) + 1 / 2) * (tn[-1] - tn[0]) / M
-            tt = psi_warp(tr, alpha)
-        else:
-            tn = (np.arange(0, K) - (K - 1) / 2) / sr
-            tt = tn[0] + (np.arange(0, M) + 1 / 2) * (tn[-1] - tn[0]) / M
+    n_columns = MAX_MEM_BLOCK // (stft_matrix.shape[0] * stft_matrix.itemsize)
+    n_columns = max(n_columns, 1)
+    
+    if alpha != 0:
+        tn = (np.arange(win_length)-(win_length-1)/2)/sr
+        tr = phi_warp(tn[0], alpha) + (np.arange(M) + 1/2 )*(tn[-1]-tn[0])/M
+        tt = psi_warp(tr, alpha)
+    else: # caso alpha = 0 não é a fft normal?
+        tn = (np.arange(0, win_length) - (win_length - 1) / 2) / sr                           
+        tt = tn[0] + (np.arange(0, M) + 1 / 2) * (tn[-1] - tn[0]) / M
 
-        # da pra usar M no lugar de len(w)
-        frames = np.zeros((len(w), len(time)))
-        for frame_ind in range(len(time + 1)):
-            t0 = frame_ind * hop_size
-            xn = x[t0:t0+K]
-            xr = interp1d(tn, xn)(tt)
-            frames[:, frame_ind] = xr * w
-            X = np.fft.fft(frames, axis=1)
-            STFChT = X[1:K // 2 + 1, :]
-    else:
-        for frame_ind in range(len(time)):
-            alpha_max = max(alphas)
-            M = 2 ** np.ceil(np.log2(np.ceil(K / (1-abs(alpha_max/sr) * K/2))))
-            w = sig.resample(w, M, K)  # Era N troquei por K
+    for bl_s in range(0, stft_matrix.shape[1], n_columns):
+        bl_t = min(bl_s + n_columns, stft_matrix.shape[1])
 
-            if alphas[frame_ind] != 0:
-                tn = (np.arange(0, K) - (K - 1) / 2) / sr
-                tr = phi_warp(tn[0], alphas[frame_ind]) + (np.arange(0, M) + 1 / 2) * (tn[-1] - tn[0]) / M
-                tt = psi_warp(tr, alphas[frame_ind])
-            else:
-                tn = (np.arange(0, K) - (K - 1) / 2) / sr
-                tt = tn[0] + (np.arange(0, M) + 1 / 2) * (tn[-1] - tn[0]) / M
-
-            t0 = frame_ind * hop_size
-            xn = x[t0:t0+K]
-            xr = interp1d(tn, xn)(tt)
-            Xr = np.fft.fft(xr * w)
-            STFChT[:, frame_ind] = Xr[0:K // 2 + 1]
-
-    return STFChT, freq, time
+        stft_matrix[:, bl_s:bl_t] = np.fft.rfft(
+            fft_window * interp1d(tn, y_frames[:, bl_s:bl_t], axis=0)(tt), axis=0
+        )[:win_length//2+1, :]
+    return stft_matrix
